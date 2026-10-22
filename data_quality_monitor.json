@@ -1,0 +1,959 @@
+{
+  "name": "Data Quality Monitor (rules in Postgres, incidents, Telegram Ack/Snooze)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Data Quality Monitor\nRules live in the `dq_rules` table (no workflow edits needed). Every 5 minutes the due rules run as read-only queries against your data, results are stored, and an incident opens after N consecutive failures. Alerts arrive in Telegram with Acknowledge and Snooze buttons; recovery is announced; a daily report summarizes everything.\n\n**Setup:** run `sql/schema.sql`, create the read-only role (`sql/readonly_role.sql`), create 3 credentials (Postgres state, Postgres read-only, Telegram), replace the `REPLACE_*` values, add rules (`sql/example_rules.sql`), activate.",
+        "height": 380,
+        "width": 860,
+        "color": 4
+      },
+      "id": "baccadc0-0d9d-4185-808b-bf61e9838138",
+      "name": "Notes - General",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -460
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Safety\n`Run Check` must use the **read-only** credential with a statement timeout. Table and column names are validated and quoted; `where_clause` and `custom_sql` are screened, and custom SQL is wrapped so it cannot run data-modifying statements. Only rule authors (people who can write to `dq_rules`) can define checks.\nButtons work only for user ids in `ALLOWED_USER_IDS` (placeholder = nobody).",
+        "height": 250,
+        "width": 540,
+        "color": 3
+      },
+      "id": "c899a445-cb33-4a3a-83b8-20d408304ccf",
+      "name": "Notes - Safety",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        700,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/5 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "4b8d4063-e2d3-4e07-8589-00b3fde89728",
+      "name": "Check Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        100
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "be850f73-23ae-475f-9cf7-80af26df97e3",
+      "name": "Manual Check",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH due AS (\n  SELECT id FROM dq_rules\n  WHERE enabled AND next_run_at <= now()\n  ORDER BY next_run_at\n  LIMIT 50\n  FOR UPDATE SKIP LOCKED\n), claimed AS (\n  UPDATE dq_rules r\n  SET next_run_at = now() + make_interval(mins => r.interval_minutes)\n  FROM due WHERE r.id = due.id\n  RETURNING r.*\n)\nSELECT c.id, c.name, c.kind, c.table_name, c.column_name, c.key_columns, c.where_clause, c.window_minutes, c.custom_sql,\n       c.min_value, c.max_value, c.anomaly_k, c.severity,\n       COALESCE((SELECT json_agg(h.value ORDER BY h.checked_at DESC)\n                 FROM (SELECT value, checked_at FROM dq_results\n                       WHERE rule_id = c.id AND value IS NOT NULL\n                       ORDER BY checked_at DESC LIMIT 30) h), '[]'::json) AS history\nFROM claimed c\nORDER BY c.id",
+        "options": {}
+      },
+      "id": "5aaee831-b98e-4ebf-9125-94ef741ab10f",
+      "name": "Load Due Rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres (state)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Turns each due rule into one read-only SQL statement. Identifiers are validated and quoted;\n// free-text clauses (where_clause, custom_sql) are screened. The read-only database role is the real safety net.\nconst IDENT = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/;\nconst qi = s => { const t = String(s).trim(); if (!IDENT.test(t)) throw new Error('invalid identifier \"' + t.slice(0, 40) + '\"'); return '\"' + t + '\"'; };\nconst qt = s => { const p = String(s).trim().split('.'); if (p.length > 2) throw new Error('table must be \"table\" or \"schema.table\"'); return p.map(qi).join('.'); };\nconst BAD = /;|--|\\/\\*|\\*\\/|\\\\|\\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|copy|call|do|execute|vacuum|analyze|lock|listen|notify|set|reset|into|refresh|comment|reindex|cluster|pg_\\w*|lo_\\w*|dblink\\w*)\\b/i;\nconst screen = (text, field, allowSelect) => {\n  const t = String(text).trim();\n  if (!t || t.length > 1000) throw new Error(field + ' must be 1-1000 characters');\n  if (BAD.test(t)) throw new Error(field + ' contains a forbidden keyword or character');\n  if (!allowSelect && /\\b(select|union|with)\\b/i.test(t)) throw new Error(field + ' must be a plain condition (no subqueries)');\n  if ((t.match(/'/g) || []).length % 2 || (t.match(/\"/g) || []).length % 2) throw new Error(field + ' has unbalanced quotes');\n  let depth = 0;\n  for (const ch of t) { if (ch === '(') depth++; else if (ch === ')') { depth--; if (depth < 0) break; } }\n  if (depth !== 0) throw new Error(field + ' has unbalanced parentheses');\n  return t;\n};\nconst posInt = (v, f) => { const n = Number(v); if (!Number.isInteger(n) || n < 1 || n > 525600) throw new Error(f + ' must be a whole number between 1 and 525600'); return n; };\n\nreturn $input.all().map(({ json: r }) => {\n  const out = { ...r, sql: null, config_error: null };\n  try {\n    const id = Number(r.id);\n    if (!Number.isInteger(id) || id < 1) throw new Error('bad rule id');\n    const w = r.where_clause ? screen(r.where_clause, 'where_clause', false) : null;\n    const where = w ? ' WHERE (' + w + ')' : '';\n    let inner;\n    switch (r.kind) {\n      case 'row_count':\n        inner = 'SELECT count(*)::float8 AS value FROM ' + qt(r.table_name) + where; break;\n      case 'freshness_minutes':\n        inner = 'SELECT (EXTRACT(EPOCH FROM (now() - max(' + qi(r.column_name) + '))) / 60)::float8 AS value FROM ' + qt(r.table_name) + where; break;\n      case 'null_pct':\n        inner = 'SELECT (CASE WHEN count(*) = 0 THEN 0 ELSE 100.0 * count(*) FILTER (WHERE ' + qi(r.column_name) + ' IS NULL) / count(*) END)::float8 AS value FROM ' + qt(r.table_name) + where; break;\n      case 'duplicate_count': {\n        const keys = String(r.key_columns).split(',').map(s => s.trim()).filter(Boolean);\n        if (!keys.length || keys.length > 5) throw new Error('key_columns needs 1-5 columns');\n        inner = 'SELECT count(*)::float8 AS value FROM (SELECT 1 FROM ' + qt(r.table_name) + where + ' GROUP BY ' + keys.map(qi).join(', ') + ' HAVING count(*) > 1) d'; break;\n      }\n      case 'window_count': {\n        const n = posInt(r.window_minutes, 'window_minutes');\n        inner = 'SELECT count(*)::float8 AS value FROM ' + qt(r.table_name) + ' WHERE ' + qi(r.column_name) + ' >= now() - (' + n + ' * interval \\'1 minute\\')' + (w ? ' AND (' + w + ')' : ''); break;\n      }\n      case 'custom_sql': {\n        const s = screen(r.custom_sql, 'custom_sql', true);\n        if (!/^(select|with)\\b/i.test(s)) throw new Error('custom_sql must start with SELECT or WITH');\n        inner = 'SELECT (c.value)::float8 AS value FROM (' + s + ') c'; break;\n      }\n      default: throw new Error('unknown kind \"' + r.kind + '\"');\n    }\n    // always exactly one row: a scalar sub-select yields NULL when the inner query returns nothing\n    out.sql = 'SELECT ' + id + '::int AS rule_id, (SELECT v.value FROM (' + inner + ') v LIMIT 1) AS value';\n  } catch (e) {\n    out.config_error = String(e.message).slice(0, 200);\n    out.sql = 'SELECT ' + (Number(r.id) | 0) + '::int AS rule_id, NULL::float8 AS value';\n  }\n  return { json: out };\n});"
+      },
+      "id": "cfc257ff-1bff-4c9d-9ddc-4ae2108ffb61",
+      "name": "Build Check Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "id": "6140ba68-0a1f-4135-b221-0371c8d5ee57",
+      "name": "Run Check",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres (read-only)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Compares each measured value with its thresholds and, when anomaly_k is set, with the recent history (median / MAD).\nconst builds = $('Build Check Query').all().map(i => i.json);\nconst fmt = x => Number.isInteger(x) ? String(x) : x.toFixed(2);\nconst median = a => { const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };\nconst clean = v => String(v).replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 300);\nconst num = v => (v === null || v === undefined || v === '') ? null : Number(v);\nconst out = [];\n$input.all().forEach((it, i) => {\n  const j = it.json || {};\n  const b = (j.rule_id !== undefined && j.rule_id !== null) ? builds.find(x => Number(x.id) === Number(j.rule_id)) : builds[i];\n  if (!b) return;\n  const res = status => ({ json: { rule_id: Number(b.id), status: status.s, value: status.v === undefined ? null : status.v, detail: status.d } });\n  if (b.config_error) { out.push(res({ s: 'error', d: 'Invalid rule: ' + clean(b.config_error) })); return; }\n  if (j.error) {\n    const m = typeof j.error === 'string' ? j.error : (j.error.message || JSON.stringify(j.error));\n    out.push(res({ s: 'error', d: 'Check could not run: ' + clean(m) })); return;\n  }\n  const v = num(j.value);\n  if (v === null || !Number.isFinite(v)) {\n    out.push(b.kind === 'freshness_minutes' ? res({ s: 'fail', d: 'No rows to measure freshness' }) : res({ s: 'error', d: 'The check returned no value' }));\n    return;\n  }\n  const min = num(b.min_value), max = num(b.max_value), k = num(b.anomaly_k);\n  const reasons = [];\n  let note = '';\n  if (min !== null && v < min) reasons.push('value ' + fmt(v) + ' is below the minimum ' + fmt(min));\n  if (max !== null && v > max) reasons.push('value ' + fmt(v) + ' is above the maximum ' + fmt(max));\n  if (k !== null) {\n    const hist = (Array.isArray(b.history) ? b.history : []).map(Number).filter(Number.isFinite);\n    if (hist.length >= 10) {\n      const med = median(hist), mad = median(hist.map(h => Math.abs(h - med)));\n      const scale = mad > 0 ? 1.4826 * mad : Math.max(Math.abs(med) * 0.1, 1);\n      const z = Math.abs(v - med) / scale;\n      if (z > k) reasons.push('anomaly: ' + fmt(v) + ' vs typical ' + fmt(med) + ' (score ' + z.toFixed(1) + ' > ' + k + ')');\n    } else note = ' (learning baseline: ' + hist.length + '/10 samples)';\n  }\n  out.push(reasons.length ? res({ s: 'fail', v, d: reasons.join('; ') }) : res({ s: 'ok', v, d: 'value ' + fmt(v) + note }));\n});\nreturn out;"
+      },
+      "id": "819b3453-118a-47e6-9bec-9e6ac788dc50",
+      "name": "Evaluate Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH r AS (\n  SELECT id, severity, min_failures, fail_streak FROM dq_rules WHERE id = $1::int FOR UPDATE\n), ins AS (\n  INSERT INTO dq_results (rule_id, status, value, detail)\n  SELECT id, $2::text, NULLIF($3::text, '')::float8, $4::text FROM r\n  RETURNING id\n), upd AS (\n  UPDATE dq_rules\n  SET last_status = $2::text, last_value = NULLIF($3::text, '')::float8, last_checked_at = now(),\n      fail_streak = CASE WHEN $2::text = 'ok' THEN 0 ELSE fail_streak + 1 END\n  WHERE id IN (SELECT id FROM r)\n  RETURNING id\n), seen AS (\n  UPDATE dq_incidents\n  SET last_seen_at = now(), occurrences = occurrences + 1, summary = $4::text, severity = (SELECT severity FROM r)\n  WHERE rule_id IN (SELECT id FROM r) AND status IN ('open', 'acked') AND $2::text <> 'ok'\n  RETURNING id\n), opened AS (\n  INSERT INTO dq_incidents (rule_id, severity, summary)\n  SELECT id, severity, $4::text FROM r\n  WHERE $2::text <> 'ok' AND fail_streak + 1 >= min_failures\n    AND NOT EXISTS (SELECT 1 FROM dq_incidents i WHERE i.rule_id = r.id AND i.status IN ('open', 'acked'))\n  ON CONFLICT DO NOTHING\n  RETURNING id\n), closed AS (\n  UPDATE dq_incidents SET status = 'resolved', resolved_at = now()\n  WHERE rule_id IN (SELECT id FROM r) AND status IN ('open', 'acked') AND $2::text = 'ok'\n  RETURNING id\n)\nSELECT $1::int AS rule_id, (SELECT count(*) FROM opened)::int AS opened, (SELECT count(*) FROM closed)::int AS resolved",
+        "options": {
+          "queryReplacement": "={{ [ $json.rule_id, $json.status, $json.value === null ? '' : String($json.value), $json.detail ] }}"
+        }
+      },
+      "id": "7be1c3aa-c25f-417a-a21d-f537ccf88cbd",
+      "name": "Record Result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1300,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres (state)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "2-59/5 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "1facecef-20b5-4f0c-85b6-8a2a3314431a",
+      "name": "Notify Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH due AS (\n  SELECT i.id\n  FROM dq_incidents i JOIN dq_rules r ON r.id = i.rule_id\n  WHERE i.status = 'open'\n    AND (r.snooze_until IS NULL OR r.snooze_until <= now())\n    AND (i.last_notified_at IS NULL\n         OR (r.reminder_minutes > 0 AND i.last_notified_at <= now() - make_interval(mins => r.reminder_minutes)))\n  ORDER BY (i.severity = 'critical') DESC, i.opened_at\n  LIMIT 20\n  FOR UPDATE OF i SKIP LOCKED\n), n AS (\n  UPDATE dq_incidents i SET last_notified_at = now(), notify_count = i.notify_count + 1\n  FROM due WHERE i.id = due.id\n  RETURNING i.id\n), rec AS (\n  SELECT id FROM dq_incidents\n  WHERE status = 'resolved' AND NOT recovery_notified\n  ORDER BY resolved_at\n  LIMIT 20\n  FOR UPDATE SKIP LOCKED\n), rn AS (\n  UPDATE dq_incidents SET recovery_notified = TRUE WHERE id IN (SELECT id FROM rec)\n  RETURNING id\n)\nSELECT i.id AS incident_id, d.event, r.name, r.kind, i.severity, i.summary, i.occurrences,\n       i.opened_at, i.resolved_at, i.notify_count\nFROM (SELECT id, 'alert'::text AS event FROM due UNION ALL SELECT id, 'recovered'::text FROM rec) d\nJOIN dq_incidents i ON i.id = d.id\nJOIN dq_rules r ON r.id = i.rule_id\nWHERE d.event = 'alert' OR i.notify_count > 0\nORDER BY (i.severity = 'critical') DESC, i.opened_at",
+        "options": {}
+      },
+      "id": "618eca5e-8285-4f90-86fa-670f624e1e78",
+      "name": "Claim Notifications",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        640
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres (state)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const TZ = 'Asia/Jakarta';\nconst esc = s => String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst when = v => { const d = new Date(v); return isNaN(d) ? '-' : new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(d); };\nconst dur = ms => { const m = Math.max(0, Math.round(ms / 60000)); if (m < 60) return m + 'm'; const h = Math.floor(m / 60); if (h < 48) return h + 'h ' + (m % 60) + 'm'; return Math.floor(h / 24) + 'd ' + (h % 24) + 'h'; };\nconst out = [];\nfor (const { json: r } of $input.all()) {\n  if (!r.incident_id) continue;\n  const crit = r.severity === 'critical';\n  let text, buttons = false;\n  if (r.event === 'recovered') {\n    const open = r.resolved_at && r.opened_at ? ' after ' + dur(new Date(r.resolved_at) - new Date(r.opened_at)) : '';\n    text = '✅ <b>Recovered</b>: ' + esc(r.name) + '\\nBack to normal' + open + '.\\nIncident #' + r.incident_id;\n  } else {\n    const again = Number(r.notify_count) > 0;\n    text = (crit ? '🔴 <b>CRITICAL</b>' : '🟠 <b>WARNING</b>') + (again ? ' (reminder)' : '') + ': ' + esc(r.name) + '\\n' + esc(r.summary) +\n      '\\nOpen since ' + when(r.opened_at) + ', seen ' + r.occurrences + (Number(r.occurrences) === 1 ? ' time' : ' times') + '\\nIncident #' + r.incident_id;\n    buttons = true;\n  }\n  out.push({ json: { incident_id: Number(r.incident_id), text, has_buttons: buttons } });\n}\nreturn out;"
+      },
+      "id": "6e06bfdd-2222-454b-befc-3a8ba99b05fc",
+      "name": "Format Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "49cabfa7-680b-4c88-bf3d-d4e1719a2ec9",
+              "leftValue": "={{ $json.has_buttons }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d62a07b7-7629-4c97-849e-ca29594b7d3d",
+      "name": "Needs Buttons?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        },
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Acknowledge",
+                    "additionalFields": {
+                      "callback_data": "={{ 'dq:ack:' + $json.incident_id }}"
+                    }
+                  },
+                  {
+                    "text": "😴 1h",
+                    "additionalFields": {
+                      "callback_data": "={{ 'dq:snz1:' + $json.incident_id }}"
+                    }
+                  },
+                  {
+                    "text": "😴 24h",
+                    "additionalFields": {
+                      "callback_data": "={{ 'dq:snz24:' + $json.incident_id }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "id": "dea55595-bed9-4733-8eb4-59e0a5fed108",
+      "name": "Send Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        560
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "7b726492-8a85-454d-987a-e48cd0131370",
+      "name": "Send Recovery",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        740
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "id": "e4e6a545-07b2-42cd-8a48-a6adda4e5c47",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        1100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      },
+      "webhookId": "827c2eec-b3a1-47b8-8867-ea82ab857a2c"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_USER_IDS = ['REPLACE_WITH_TELEGRAM_USER_ID'];   // who may acknowledge or snooze. Fail closed: the placeholder authorizes nobody.\nconst cq = $input.first().json.callback_query;\nif (!cq) return [{ json: { authorized: false, query_id: null } }];\nconst m = /^dq:(ack|snz1|snz24):(\\d{1,9})$/.exec(String(cq.data || ''));\nconst fromId = String(cq.from && cq.from.id);\nconst authorized = !!m && !!cq.message && ALLOWED_USER_IDS.includes(fromId);\nreturn [{ json: {\n  authorized,\n  query_id: cq.id,\n  action: m ? (m[1] === 'ack' ? 'ack' : 'snooze') : null,\n  hours: m ? (m[1] === 'snz1' ? 1 : m[1] === 'snz24' ? 24 : 0) : 0,\n  incident_id: m ? Number(m[2]) : null,\n  decided_by: (cq.from && cq.from.username ? String(cq.from.username) + ' ' : '') + '(' + fromId + ')',\n  chat_id: cq.message ? cq.message.chat.id : null,\n  message_id: cq.message ? cq.message.message_id : null,\n  orig_text: cq.message && typeof cq.message.text === 'string' ? cq.message.text : ''\n} }];"
+      },
+      "id": "8c2f8c10-d2bd-4f6c-881f-0672d7e21c01",
+      "name": "Parse Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1b4d367e-3bc8-429c-927f-6826f8eb9204",
+              "leftValue": "={{ $json.authorized }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7d139334-77c3-4b20-b4a8-91df22516aa8",
+      "name": "Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "callback",
+        "operation": "answerQuery",
+        "queryId": "={{ $json.query_id }}",
+        "additionalFields": {
+          "text": "You are not allowed to do this",
+          "show_alert": true
+        }
+      },
+      "id": "7528e4ad-c39b-4f0c-a4d3-c352053abedf",
+      "name": "Answer Denied",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        780,
+        1260
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH inc AS (\n  SELECT id, rule_id, status FROM dq_incidents WHERE id = $1::int FOR UPDATE\n), ack AS (\n  UPDATE dq_incidents SET status = 'acked', acked_by = $3::text, acked_at = now()\n  WHERE id IN (SELECT id FROM inc) AND $2::text = 'ack' AND status = 'open'\n  RETURNING id\n), snz AS (\n  UPDATE dq_rules SET snooze_until = now() + make_interval(hours => $4::int)\n  WHERE id IN (SELECT rule_id FROM inc WHERE status IN ('open', 'acked')) AND $2::text = 'snooze' AND $4::int BETWEEN 1 AND 24\n  RETURNING id, snooze_until\n), rst AS (\n  UPDATE dq_incidents SET last_notified_at = NULL\n  WHERE id IN (SELECT id FROM inc) AND status = 'open' AND $2::text = 'snooze' AND $4::int BETWEEN 1 AND 24\n  RETURNING id\n)\nSELECT CASE WHEN NOT EXISTS (SELECT 1 FROM inc) THEN 'gone'\n            WHEN EXISTS (SELECT 1 FROM ack) THEN 'acked'\n            WHEN EXISTS (SELECT 1 FROM snz) THEN 'snoozed'\n            ELSE 'not_open' END AS outcome,\n       (SELECT snooze_until FROM snz) AS snooze_until",
+        "options": {
+          "queryReplacement": "={{ [ $json.incident_id, $json.action, $json.decided_by, $json.hours ] }}"
+        }
+      },
+      "id": "41504d33-652a-43ea-b3ff-8cc35716e20a",
+      "name": "Apply Callback",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        1100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres (state)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const TZ = 'Asia/Jakarta';\nconst esc = s => String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst when = v => { const d = new Date(v); return isNaN(d) ? '-' : new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(d); };\nconst dur = ms => { const m = Math.max(0, Math.round(ms / 60000)); if (m < 60) return m + 'm'; const h = Math.floor(m / 60); if (h < 48) return h + 'h ' + (m % 60) + 'm'; return Math.floor(h / 24) + 'd ' + (h % 24) + 'h'; };\nconst ctx = $('Parse Callback').first().json;\nconst r = $input.first().json || {};\nlet line, toast;\nswitch (r.outcome) {\n  case 'acked': line = '✅ Acknowledged by ' + esc(ctx.decided_by); toast = 'Acknowledged'; break;\n  case 'snoozed': line = '😴 Snoozed until ' + when(r.snooze_until) + ' by ' + esc(ctx.decided_by); toast = 'Snoozed for ' + ctx.hours + 'h'; break;\n  case 'not_open': line = 'ℹ️ Already handled or resolved'; toast = 'Already handled or resolved'; break;\n  default: line = 'ℹ️ Incident no longer exists'; toast = 'Incident not found';\n}\nreturn [{ json: { chat_id: ctx.chat_id, message_id: ctx.message_id, query_id: ctx.query_id, toast,\n  text: esc(ctx.orig_text) + '\\n\\n' + line } }];"
+      },
+      "id": "47a55e85-9dc3-4f06-bea7-0957d9480d61",
+      "name": "Format Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "={{ $json.chat_id }}",
+        "messageId": "={{ $json.message_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "4ed74670-97af-49c8-a67f-f5049312064e",
+      "name": "Edit Alert Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1300,
+        1100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "callback",
+        "operation": "answerQuery",
+        "queryId": "={{ $('Format Decision').first().json.query_id }}",
+        "additionalFields": {
+          "text": "={{ $('Format Decision').first().json.toast }}"
+        }
+      },
+      "id": "16d4b317-4814-41ad-982d-a294aeda30bd",
+      "name": "Answer Callback",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1560,
+        1100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "9607478e-8c82-4e6f-afb5-8fc7767f5aea",
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        1600
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "9092bab4-0928-4de6-a679-3aa954124df6",
+      "name": "Manual Report",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1760
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH d AS (DELETE FROM dq_results WHERE checked_at < now() - interval '90 days' RETURNING 1)\nSELECT count(*)::int AS deleted FROM d",
+        "options": {}
+      },
+      "id": "21940ae3-d1e7-4624-b853-ef789edc4100",
+      "name": "Cleanup Old Results",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        1680
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres (state)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT json_build_object(\n  'rules',    (SELECT count(*) FROM dq_rules WHERE enabled),\n  'failing',  (SELECT count(*) FROM dq_rules WHERE enabled AND last_status IN ('fail', 'error')),\n  'snoozed',  (SELECT count(*) FROM dq_rules WHERE enabled AND snooze_until > now()),\n  'never_run',(SELECT count(*) FROM dq_rules WHERE enabled AND last_checked_at IS NULL AND created_at < now() - interval '1 hour'),\n  'stale',    (SELECT count(*) FROM dq_rules WHERE enabled AND last_checked_at IS NOT NULL\n                 AND last_checked_at < now() - make_interval(mins => interval_minutes * 3 + 15)),\n  'checks_24h', (SELECT count(*) FROM dq_results WHERE checked_at > now() - interval '24 hours'),\n  'fails_24h',  (SELECT count(*) FROM dq_results WHERE checked_at > now() - interval '24 hours' AND status <> 'ok'),\n  'open_incidents', COALESCE((SELECT json_agg(x) FROM (\n      SELECT i.id, r.name AS rule, i.severity, i.status, i.opened_at, i.summary\n      FROM dq_incidents i JOIN dq_rules r ON r.id = i.rule_id\n      WHERE i.status IN ('open', 'acked')\n      ORDER BY (i.severity = 'critical') DESC, i.opened_at LIMIT 15) x), '[]'::json),\n  'noisiest', COALESCE((SELECT json_agg(x) FROM (\n      SELECT r.name AS rule, count(*) FILTER (WHERE s.status <> 'ok') AS fails, count(*) AS checks\n      FROM dq_results s JOIN dq_rules r ON r.id = s.rule_id\n      WHERE s.checked_at > now() - interval '24 hours'\n      GROUP BY r.name HAVING count(*) FILTER (WHERE s.status <> 'ok') > 0\n      ORDER BY 2 DESC, 1 LIMIT 5) x), '[]'::json)\n) AS report",
+        "options": {}
+      },
+      "id": "f11763ad-ca55-4b63-ae94-a6740badf1e5",
+      "name": "Digest Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        520,
+        1680
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres (state)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const deleted = $('Cleanup Old Results').first().json.deleted;\nconst TZ = 'Asia/Jakarta';\nconst esc = s => String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst when = v => { const d = new Date(v); return isNaN(d) ? '-' : new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(d); };\nconst dur = ms => { const m = Math.max(0, Math.round(ms / 60000)); if (m < 60) return m + 'm'; const h = Math.floor(m / 60); if (h < 48) return h + 'h ' + (m % 60) + 'm'; return Math.floor(h / 24) + 'd ' + (h % 24) + 'h'; };\nconst r = { ...(($input.first().json || {}).report || {}), deleted };\nconst L = [];\nconst rules = Number(r.rules || 0), failing = Number(r.failing || 0);\nL.push((failing ? '🔴' : '🟢') + ' <b>Data quality report</b>');\nL.push('Rules: ' + rules + ' active, ' + failing + ' failing, ' + Number(r.snoozed || 0) + ' snoozed');\nconst c = Number(r.checks_24h || 0), f = Number(r.fails_24h || 0);\nL.push('Last 24h: ' + c + ' checks, ' + (c ? ((c - f) / c * 100).toFixed(1) : '0') + '% passed');\nif (Number(r.stale || 0) > 0) L.push('⚠️ ' + r.stale + ' rule(s) have not run on time. Is the check workflow active?');\nif (Number(r.never_run || 0) > 0) L.push('ℹ️ ' + r.never_run + ' rule(s) have never run yet');\nconst inc = Array.isArray(r.open_incidents) ? r.open_incidents : [];\nif (inc.length) {\n  L.push('', '<b>Open incidents</b>');\n  for (const i of inc) L.push((i.severity === 'critical' ? '🔴' : '🟠') + ' #' + i.id + ' ' + esc(i.rule) + (i.status === 'acked' ? ' (acked)' : '') + ' since ' + when(i.opened_at) + '\\n    ' + esc(i.summary));\n} else L.push('', 'No open incidents.');\nconst noisy = Array.isArray(r.noisiest) ? r.noisiest : [];\nif (noisy.length) { L.push('', '<b>Most failures (24h)</b>'); for (const n of noisy) L.push('• ' + esc(n.rule) + ': ' + n.fails + ' of ' + n.checks); }\nif (Number(r.deleted || 0) > 0) L.push('', 'Cleanup: removed ' + r.deleted + ' old results');\nreturn [{ json: { text: L.join('\\n').slice(0, 3900) } }];"
+      },
+      "id": "0185ddab-64b5-4903-93dc-12594151deaa",
+      "name": "Format Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        1680
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "82acf4f0-56fa-4e5d-8093-6d48a796e56f",
+      "name": "Send Digest",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        1680
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "8fba9ba7-f42d-4707-9248-e2b55737b09c",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        2100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const e = $input.first().json;\nconst wf = (e.workflow && e.workflow.name) || 'unknown workflow';\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst msg = (e.execution && e.execution.error && e.execution.error.message) || 'unknown error';\nconst url = (e.execution && e.execution.url) || '';\nreturn [{ json: { text: 'WORKFLOW ERROR\\n\\nWorkflow: ' + wf + '\\nFailed node: ' + node + '\\nError: ' + String(msg).slice(0, 500) + (url ? '\\n' + url : '') } }];"
+      },
+      "id": "3d57ea75-be3b-4089-a642-3bab3260eb89",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        2100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "5307d0a0-f7aa-4aab-809f-79e9c035c672",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        2100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Check Schedule": {
+      "main": [
+        [
+          {
+            "node": "Load Due Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Check": {
+      "main": [
+        [
+          {
+            "node": "Load Due Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Due Rules": {
+      "main": [
+        [
+          {
+            "node": "Build Check Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Check Query": {
+      "main": [
+        [
+          {
+            "node": "Run Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Check": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Results": {
+      "main": [
+        [
+          {
+            "node": "Record Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Schedule": {
+      "main": [
+        [
+          {
+            "node": "Claim Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Notifications": {
+      "main": [
+        [
+          {
+            "node": "Format Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alerts": {
+      "main": [
+        [
+          {
+            "node": "Needs Buttons?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Buttons?": {
+      "main": [
+        [
+          {
+            "node": "Send Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Callback": {
+      "main": [
+        [
+          {
+            "node": "Authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Authorized?": {
+      "main": [
+        [
+          {
+            "node": "Apply Callback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Answer Denied",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Callback": {
+      "main": [
+        [
+          {
+            "node": "Format Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Decision": {
+      "main": [
+        [
+          {
+            "node": "Edit Alert Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Alert Message": {
+      "main": [
+        [
+          {
+            "node": "Answer Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Schedule": {
+      "main": [
+        [
+          {
+            "node": "Cleanup Old Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Report": {
+      "main": [
+        [
+          {
+            "node": "Cleanup Old Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleanup Old Results": {
+      "main": [
+        [
+          {
+            "node": "Digest Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Digest Stats": {
+      "main": [
+        [
+          {
+            "node": "Format Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Digest": {
+      "main": [
+        [
+          {
+            "node": "Send Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jakarta"
+  },
+  "active": false,
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
